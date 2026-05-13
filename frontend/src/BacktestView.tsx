@@ -20,7 +20,8 @@ export default function BacktestView() {
     setRunning(true)
     try {
       await api.runBacktest(scannerName, days)
-      setTimeout(loadRuns, 1000)
+      await new Promise(r => setTimeout(r, 1000))
+      loadRuns()
     } catch (e) {
       console.error(e)
     }

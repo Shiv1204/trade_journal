@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Depends, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 from backend.database import init_db, get_db, SessionLocal
@@ -42,26 +44,30 @@ def health():
 
 
 @app.post("/api/scanner/run")
-def run_scanner(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def run_scanner(background_tasks: BackgroundTasks):
     def _scrape_and_store():
-        data = scrape_both_scanners()
-        for scanner_key in ["scanner_1", "scanner_2"]:
-            scanner = data[scanner_key]
-            run = ScannerRun(
-                scanner_name=scanner["name"],
-                stock_count=scanner["count"],
-            )
-            db.add(run)
-            db.flush()
-            for r in scanner["results"]:
-                result = ScannerResult(
-                    run_id=run.id,
-                    symbol=r["symbol"],
-                    price=r["price"],
+        db = SessionLocal()
+        try:
+            data = scrape_both_scanners()
+            for scanner_key in ["scanner_1", "scanner_2"]:
+                scanner = data[scanner_key]
+                run = ScannerRun(
                     scanner_name=scanner["name"],
+                    stock_count=scanner["count"],
                 )
-                db.add(result)
-        db.commit()
+                db.add(run)
+                db.flush()
+                for r in scanner["results"]:
+                    result = ScannerResult(
+                        run_id=run.id,
+                        symbol=r["symbol"],
+                        price=r["price"],
+                        scanner_name=scanner["name"],
+                    )
+                    db.add(result)
+            db.commit()
+        finally:
+            db.close()
 
     background_tasks.add_task(_scrape_and_store)
     return {"message": "Scanner run started in background"}
@@ -69,16 +75,17 @@ def run_scanner(background_tasks: BackgroundTasks, db: Session = Depends(get_db)
 
 @app.get("/api/scanner/latest")
 def get_latest_scanner_results(db: Session = Depends(get_db)):
-    runs = db.query(ScannerRun).order_by(ScannerRun.id.desc()).limit(2).all()
-    scanner_1_results = []
-    scanner_2_results = []
-    for run in runs:
+    run_1 = db.query(ScannerRun).filter(ScannerRun.scanner_name == SCANNER_1_NAME).order_by(ScannerRun.id.desc()).first()
+    run_2 = db.query(ScannerRun).filter(ScannerRun.scanner_name == SCANNER_2_NAME).order_by(ScannerRun.id.desc()).first()
+
+    def format_results(run):
+        if not run:
+            return []
         results = db.query(ScannerResult).filter(ScannerResult.run_id == run.id).all()
-        formatted = [{"symbol": r.symbol, "price": r.price} for r in results]
-        if run.scanner_name == SCANNER_1_NAME:
-            scanner_1_results = formatted
-        else:
-            scanner_2_results = formatted
+        return [{"symbol": r.symbol, "price": r.price} for r in results]
+
+    scanner_1_results = format_results(run_1)
+    scanner_2_results = format_results(run_2)
 
     dedup = find_duplicates(scanner_1_results, scanner_2_results)
     return {
@@ -157,7 +164,11 @@ def start_backtest(
     start_date = end_date - timedelta(days=days)
 
     def _run():
-        run_backtest(scanner_name, start_date, end_date)
+        db = SessionLocal()
+        try:
+            run_backtest(scanner_name, start_date, end_date, db=db)
+        finally:
+            db.close()
 
     background_tasks.add_task(_run)
     return {
@@ -206,7 +217,26 @@ def get_backtest_run_detail(run_id: int, db: Session = Depends(get_db)):
 @app.post("/api/positions/check")
 def check_positions(background_tasks: BackgroundTasks):
     def _check():
-        position_manager.check_positions()
+        db = SessionLocal()
+        try:
+            position_manager.check_positions(db=db)
+        finally:
+            db.close()
 
     background_tasks.add_task(_check)
     return {"message": "Position check started"}
+
+
+frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if frontend_dist.exists():
+    app.mount("/assets", StaticFiles(directory=str(frontend_dist / "assets")), name="assets")
+
+    @app.get("/{full_path:path}")
+    def serve_frontend(full_path: str):
+        file_path = frontend_dist / full_path
+        if file_path.exists() and file_path.is_file():
+            return FileResponse(str(file_path))
+        index_path = frontend_dist / "index.html"
+        if index_path.exists():
+            return FileResponse(str(index_path))
+        return JSONResponse(status_code=404, content={"error": "Not found"})

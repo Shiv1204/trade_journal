@@ -20,7 +20,8 @@ export default function ScannerView() {
     setRunning(true)
     try {
       await api.runScanner()
-      setTimeout(load, 3000)
+      await new Promise(r => setTimeout(r, 3000))
+      load()
     } catch (e) {
       console.error(e)
     }
