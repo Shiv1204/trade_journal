@@ -13,7 +13,7 @@ def find_duplicates(scanner_1_results: list[dict], scanner_2_results: list[dict]
         for r in results:
             key = r.get("symbol", "").upper()
             if key and key not in lookup:
-                lookup[key] = r.get("price")
+                lookup[key] = r
         return lookup
 
     lookup_1 = build_lookup(scanner_1_results)
@@ -21,10 +21,20 @@ def find_duplicates(scanner_1_results: list[dict], scanner_2_results: list[dict]
 
     trade_entries = []
     for symbol in deduped_trade_list:
+        r1 = lookup_1.get(symbol, {})
+        r2 = lookup_2.get(symbol, {})
         trade_entries.append({
             "symbol": symbol,
-            "price_1": lookup_1.get(symbol),
-            "price_2": lookup_2.get(symbol),
+            "price_1": r1.get("price"),
+            "price_2": r2.get("price"),
+            "change_pct_1": r1.get("change_pct"),
+            "change_pct_2": r2.get("change_pct"),
+            "volume_1": r1.get("volume"),
+            "volume_2": r2.get("volume"),
+            "daily_rsi_1": r1.get("daily_rsi"),
+            "daily_rsi_2": r2.get("daily_rsi"),
+            "weekly_rsi_1": r1.get("weekly_rsi"),
+            "weekly_rsi_2": r2.get("weekly_rsi"),
         })
 
     return {

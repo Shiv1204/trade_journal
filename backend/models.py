@@ -34,6 +34,10 @@ class ScannerResult(Base):
     symbol = Column(String(50), nullable=False)
     price = Column(Float, nullable=True)
     scanner_name = Column(String(100), nullable=False)
+    change_pct = Column(Float, nullable=True)
+    volume = Column(Integer, nullable=True)
+    daily_rsi = Column(Float, nullable=True)
+    weekly_rsi = Column(Float, nullable=True)
 
     run = relationship("ScannerRun", back_populates="results")
 

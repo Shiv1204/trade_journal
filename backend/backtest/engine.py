@@ -46,6 +46,8 @@ def run_backtest_for_symbol(
 ) -> list[dict]:
     df = df_full.copy()
     df = df.sort_index()
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
     df = df[df.index >= pd.Timestamp(start_date) - pd.DateOffset(months=6)]
     if len(df) < 250:
         return []
@@ -94,7 +96,7 @@ def run_backtest_for_symbol(
                 exit_reason = ExitReason.TARGET
             elif days_held >= MAX_HOLDING_DAYS:
                 exit_price = current_price
-                exit_reason = ExitReason.TIME
+                exit_reason = ExitReason.TIME_EXIT
 
             if exit_reason:
                 actual_pnl_pct = ((exit_price - entry_price) / entry_price) * 100

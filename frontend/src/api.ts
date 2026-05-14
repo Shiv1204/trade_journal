@@ -42,17 +42,40 @@ export interface TradeSummary {
 }
 
 export interface ScannerData {
-  scanner_1: { name: string; results: { symbol: string; price: number | null }[]; count: number }
-  scanner_2: { name: string; results: { symbol: string; price: number | null }[]; count: number }
+  scanner_1: { name: string; results: ScannerResult[]; count: number }
+  scanner_2: { name: string; results: ScannerResult[]; count: number }
   dedup: {
     only_in_scanner_1: string[]
     only_in_scanner_2: string[]
     in_both: string[]
-    trade_entries: { symbol: string; price_1: number | null; price_2: number | null }[]
+    trade_entries: DedupEntry[]
     count_only_1: number
     count_only_2: number
     count_both: number
   }
+}
+
+export interface ScannerResult {
+  symbol: string
+  price: number | null
+  change_pct: number | null
+  volume: number | null
+  daily_rsi: number | null
+  weekly_rsi: number | null
+}
+
+export interface DedupEntry {
+  symbol: string
+  price_1: number | null
+  price_2: number | null
+  change_pct_1: number | null
+  change_pct_2: number | null
+  volume_1: number | null
+  volume_2: number | null
+  daily_rsi_1: number | null
+  daily_rsi_2: number | null
+  weekly_rsi_1: number | null
+  weekly_rsi_2: number | null
 }
 
 export interface BacktestRun {

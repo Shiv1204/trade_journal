@@ -63,9 +63,18 @@ def run_scanner(background_tasks: BackgroundTasks):
                         symbol=r["symbol"],
                         price=r["price"],
                         scanner_name=scanner["name"],
+                        change_pct=r.get("change_pct"),
+                        volume=r.get("volume"),
+                        daily_rsi=r.get("daily_rsi"),
+                        weekly_rsi=r.get("weekly_rsi"),
                     )
                     db.add(result)
             db.commit()
+        except Exception as e:
+            print(f"[Scanner Error] {e}")
+            import traceback
+            traceback.print_exc()
+            db.rollback()
         finally:
             db.close()
 
@@ -82,7 +91,8 @@ def get_latest_scanner_results(db: Session = Depends(get_db)):
         if not run:
             return []
         results = db.query(ScannerResult).filter(ScannerResult.run_id == run.id).all()
-        return [{"symbol": r.symbol, "price": r.price} for r in results]
+        return [{"symbol": r.symbol, "price": r.price, "change_pct": r.change_pct,
+                 "volume": r.volume, "daily_rsi": r.daily_rsi, "weekly_rsi": r.weekly_rsi} for r in results]
 
     scanner_1_results = format_results(run_1)
     scanner_2_results = format_results(run_2)
@@ -156,9 +166,9 @@ def get_trade_summary(db: Session = Depends(get_db)):
 
 @app.post("/api/backtest/run")
 def start_backtest(
+    background_tasks: BackgroundTasks,
     scanner_name: str = Query(SCANNER_1_NAME),
     days: int = Query(365),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
 ):
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days)
@@ -167,6 +177,10 @@ def start_backtest(
         db = SessionLocal()
         try:
             run_backtest(scanner_name, start_date, end_date, db=db)
+        except Exception as e:
+            print(f"[Backtest Error] {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             db.close()
 
