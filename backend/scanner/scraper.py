@@ -123,57 +123,92 @@ def _generate_fallback_results(count: int) -> list[dict]:
 
 async def scrape_chartink_screener(url: str, timeout: int = 30000) -> list[dict]:
     results = []
+    api_response = {}
+
+    async def on_response(response):
+        if "screener/process" in response.url and response.status == 200:
+            try:
+                body = await response.json()
+                if "data" in body:
+                    api_response["data"] = body["data"]
+            except Exception:
+                pass
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
+        page.on("response", on_response)
         try:
             await page.goto(url, wait_until="networkidle", timeout=timeout)
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(5000)
 
-            rows = await page.query_selector_all("table tbody tr")
-            if not rows:
-                rows = await page.query_selector_all("div.scanner-table-row")
-
-            for row in rows:
-                cells = await row.query_selector_all("td")
-                if len(cells) < 4:
-                    continue
-                symbol_el = cells[2]
-                price_el = cells[3]
-                change_el = cells[4] if len(cells) > 4 else None
-                volume_el = cells[5] if len(cells) > 5 else None
-
-                symbol = (await symbol_el.inner_text()).strip()
-                price_text = (await price_el.inner_text()).strip()
-                price = None
-                try:
-                    price = float(re.sub(r"[^\d.]", "", price_text))
-                except ValueError:
-                    pass
-
-                change_pct = None
-                if change_el:
-                    change_text = (await change_el.inner_text()).strip()
+            if "data" in api_response:
+                for item in api_response["data"]:
+                    nsecode = item.get("nsecode", "").strip()
+                    if not nsecode:
+                        continue
+                    close = item.get("scan-column-default-close")
+                    change_pct = item.get("scan-column-default-percent-change")
+                    volume = item.get("scan-column-default-volume")
                     try:
-                        change_pct = float(re.sub(r"[^\d.\-]", "", change_text))
-                    except ValueError:
-                        pass
-
-                volume = None
-                if volume_el:
-                    volume_text = (await volume_el.inner_text()).strip()
+                        price = round(float(close), 2)
+                    except (TypeError, ValueError):
+                        price = None
                     try:
-                        volume = int(re.sub(r"[^\d]", "", volume_text))
-                    except ValueError:
-                        pass
-
-                if symbol:
+                        change_pct = round(float(change_pct), 2)
+                    except (TypeError, ValueError):
+                        change_pct = None
+                    try:
+                        volume = int(volume)
+                    except (TypeError, ValueError):
+                        volume = None
                     results.append({
-                        "symbol": symbol,
+                        "symbol": nsecode,
                         "price": price,
                         "change_pct": change_pct,
                         "volume": volume,
                     })
+            else:
+                print(f"No API data captured for {url}, falling back to HTML scraping")
+                rows = await page.query_selector_all("table tbody tr")
+                if not rows:
+                    rows = await page.query_selector_all("div.scanner-table-row")
+                for row in rows:
+                    cells = await row.query_selector_all("td")
+                    if len(cells) < 4:
+                        continue
+                    symbol_el = cells[2]
+                    price_el = cells[3]
+                    change_el = cells[4] if len(cells) > 4 else None
+                    volume_el = cells[5] if len(cells) > 5 else None
+                    symbol = (await symbol_el.inner_text()).strip()
+                    price_text = (await price_el.inner_text()).strip()
+                    price = None
+                    try:
+                        price = float(re.sub(r"[^\d.]", "", price_text))
+                    except ValueError:
+                        pass
+                    change_pct = None
+                    if change_el:
+                        change_text = (await change_el.inner_text()).strip()
+                        try:
+                            change_pct = float(re.sub(r"[^\d.\-]", "", change_text))
+                        except ValueError:
+                            pass
+                    volume = None
+                    if volume_el:
+                        volume_text = (await volume_el.inner_text()).strip()
+                        try:
+                            volume = int(re.sub(r"[^\d]", "", volume_text))
+                        except ValueError:
+                            pass
+                    if symbol:
+                        results.append({
+                            "symbol": symbol,
+                            "price": price,
+                            "change_pct": change_pct,
+                            "volume": volume,
+                        })
         except Exception as e:
             print(f"Error scraping {url}: {e}")
         finally:
@@ -181,7 +216,7 @@ async def scrape_chartink_screener(url: str, timeout: int = 30000) -> list[dict]
 
     if _is_bad_data(results):
         print(f"Scraper got bad data ({len(results)} results), using fallback for {url}")
-        results = _generate_fallback_results(18 + (hash(url) % 10))
+        results = _generate_fallback_results(22)
 
     return results
 
