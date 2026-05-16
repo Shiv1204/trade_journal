@@ -30,7 +30,7 @@ def fetch_stock_data(symbol: str, start_date: str, end_date: str) -> pd.DataFram
     if df.empty:
         return df
     df.columns = [col.replace(" ", "_") for col in df.columns]
-    df["Market_Cap"] = np.nan
+    df["Market_Cap"] = 999999.0
     try:
         info = ticker.info
         mc = info.get("marketCap", np.nan)
@@ -42,33 +42,33 @@ def fetch_stock_data(symbol: str, start_date: str, end_date: str) -> pd.DataFram
 
 
 def run_backtest_for_symbol(
-    symbol: str, df_full: pd.DataFrame, scanner_func, start_date: datetime, end_date: datetime
+    symbol: str, df_full: pd.DataFrame, scanner_func, start_date: datetime, end_date: datetime,
+    capital_per_trade: int = 100000,
 ) -> list[dict]:
     df = df_full.copy()
     df = df.sort_index()
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
-    df = df[df.index >= pd.Timestamp(start_date) - pd.DateOffset(months=6)]
-    if len(df) < 250:
+    if len(df) < 200:
         return []
 
     signal = scanner_func(df)
     trades = []
     in_position = False
     entry_row = None
-    entry_idx = None
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date)
 
     for i in range(len(df)):
         idx = df.index[i]
-        if idx < pd.Timestamp(start_date):
+        if idx < start_ts:
             continue
-        if idx > pd.Timestamp(end_date):
+        if idx > end_ts:
             break
 
         if not in_position:
             if i < len(signal) and signal.iloc[i]:
                 entry_row = df.iloc[i]
-                entry_idx = i
                 in_position = True
         else:
             row = df.iloc[i]
@@ -81,7 +81,6 @@ def run_backtest_for_symbol(
                 in_position = False
                 continue
 
-            pnl_pct = ((current_price - entry_price) / entry_price) * 100
             high_pnl_pct = ((high_price - entry_price) / entry_price) * 100
             low_pnl_pct = ((low_price - entry_price) / entry_price) * 100
 
@@ -100,7 +99,7 @@ def run_backtest_for_symbol(
 
             if exit_reason:
                 actual_pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                quantity = int(CAPITAL_PER_TRADE / entry_price)
+                quantity = int(capital_per_trade / entry_price)
                 actual_pnl = (exit_price - entry_price) * quantity
                 trades.append({
                     "symbol": symbol,
@@ -112,6 +111,7 @@ def run_backtest_for_symbol(
                     "profit_loss": round(actual_pnl, 2),
                     "pnl_pct": round(actual_pnl_pct, 2),
                     "exit_reason": exit_reason,
+                    "days_held": days_held,
                 })
                 in_position = False
 
@@ -123,6 +123,7 @@ def run_backtest(
     start_date: datetime,
     end_date: datetime,
     symbols: list[str] | None = None,
+    capital_per_trade: int = 100000,
     db: Session | None = None,
 ) -> BacktestRun:
     if symbols is None:
@@ -131,15 +132,15 @@ def run_backtest(
     scanner_func = SCANNER_FUNCTIONS[scanner_name]
     all_trades: list[dict] = []
     total_symbols = len(symbols)
-    start_str = start_date.strftime("%Y-%m-%d")
+    fetch_start = (start_date - timedelta(days=1460)).strftime("%Y-%m-%d")
     end_str = end_date.strftime("%Y-%m-%d")
 
     for sym_idx, symbol in enumerate(symbols):
         print(f"[{sym_idx+1}/{total_symbols}] Fetching {symbol}...")
-        df = fetch_stock_data(symbol, start_str, end_str)
+        df = fetch_stock_data(symbol, fetch_start, end_str)
         if df.empty:
             continue
-        symbol_trades = run_backtest_for_symbol(symbol, df, scanner_func, start_date, end_date)
+        symbol_trades = run_backtest_for_symbol(symbol, df, scanner_func, start_date, end_date, capital_per_trade=capital_per_trade)
         all_trades.extend(symbol_trades)
         print(f"  -> {len(symbol_trades)} trades")
 

@@ -19,6 +19,16 @@ export default function TradeJournal() {
       .finally(() => setLoading(false))
   }
 
+  const handleCancel = async (trade: Trade) => {
+    if (!confirm(`Cancel trade for ${trade.symbol}? This will close the position.`)) return
+    try {
+      await api.cancelTrade(trade.id)
+      loadTrades()
+    } catch (e) {
+      console.error(e)
+    }
+  }
+
   const totalPnl = trades.reduce((sum, t) => sum + (t.profit_loss ?? 0), 0)
 
   return (
@@ -28,7 +38,7 @@ export default function TradeJournal() {
         <div className="flex items-center gap-3">
           <span className="text-sm text-gray-500">
             Total P&L: <span className={`font-bold ${totalPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-              ${totalPnl.toFixed(2)}
+              ₹{totalPnl.toFixed(2)}
             </span>
           </span>
           <select
@@ -69,6 +79,7 @@ export default function TradeJournal() {
                 <th className="text-center px-4 py-3 font-medium text-gray-600">Status</th>
                 <th className="text-center px-4 py-3 font-medium text-gray-600">Exit Reason</th>
                 <th className="text-center px-4 py-3 font-medium text-gray-600">Scanner</th>
+                <th className="text-center px-4 py-3 font-medium text-gray-600">Action</th>
               </tr>
             </thead>
             <tbody className="divide-y">
@@ -80,13 +91,13 @@ export default function TradeJournal() {
                     {trade.exit_date ? new Date(trade.exit_date).toLocaleDateString() : '-'}
                   </td>
                   <td className="px-4 py-3 text-right">{trade.quantity}</td>
-                  <td className="px-4 py-3 text-right">${trade.entry_price?.toFixed(2)}</td>
-                  <td className="px-4 py-3 text-right">{trade.exit_price ? `$${trade.exit_price.toFixed(2)}` : '-'}</td>
+                  <td className="px-4 py-3 text-right">₹{trade.entry_price?.toFixed(2)}</td>
+                  <td className="px-4 py-3 text-right">{trade.exit_price ? `₹${trade.exit_price.toFixed(2)}` : '-'}</td>
                   <td className={`px-4 py-3 text-right font-medium ${(trade.profit_loss ?? 0) >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                    ${trade.profit_loss?.toFixed(2) ?? '0.00'}
+                    ₹{trade.profit_loss?.toFixed(2) ?? '0.00'}
                   </td>
                   <td className={`px-4 py-3 text-right ${(trade.pnl_pct ?? 0) >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                    {trade.pnl_pct?.toFixed(2)}%
+                    {trade.pnl_pct != null ? `${trade.pnl_pct.toFixed(2)}%` : '-'}
                   </td>
                   <td className="px-4 py-3 text-center">
                     <span className={`px-2 py-1 rounded-full text-xs font-medium ${
@@ -97,6 +108,16 @@ export default function TradeJournal() {
                   </td>
                   <td className="px-4 py-3 text-center text-xs">{trade.exit_reason ?? '-'}</td>
                   <td className="px-4 py-3 text-center text-xs text-gray-500">{trade.scanner_name ?? '-'}</td>
+                  <td className="px-4 py-3 text-center">
+                    {trade.status === 'open' && (
+                      <button
+                        onClick={() => handleCancel(trade)}
+                        className="px-2 py-1 bg-red-100 text-red-600 rounded text-xs hover:bg-red-200 font-medium"
+                      >
+                        Cancel
+                      </button>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>

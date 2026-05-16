@@ -56,6 +56,8 @@ class Trade(Base):
     status = Column(SAEnum(TradeStatus), default=TradeStatus.OPEN)
     exit_reason = Column(SAEnum(ExitReason), nullable=True)
     scanner_name = Column(String(100), nullable=True)
+    kite_order_id = Column(String(50), nullable=True)
+    kite_sl_order_id = Column(String(50), nullable=True)
 
 class BacktestRun(Base):
     __tablename__ = "backtest_runs"
@@ -93,3 +95,14 @@ class BacktestTrade(Base):
     exit_reason = Column(SAEnum(ExitReason), nullable=True)
 
     run = relationship("BacktestRun", back_populates="trades")
+
+
+class Alert(Base):
+    __tablename__ = "alerts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    alert_type = Column(String(30), nullable=False)
+    message = Column(String(500), nullable=False)
+    trade_id = Column(Integer, nullable=True)
+    symbol = Column(String(50), nullable=True)

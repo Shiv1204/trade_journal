@@ -76,6 +76,15 @@ export interface DedupEntry {
   daily_rsi_2: number | null
   weekly_rsi_1: number | null
   weekly_rsi_2: number | null
+  score: number
+  grade: string
+  reasons: string[]
+  backtest_win_rate: number | null
+  backtest_trades: number
+  backtest_total_pnl: number | null
+  daily_rsi_avg: number | null
+  weekly_rsi_avg: number | null
+  avg_volume: number
 }
 
 export interface BacktestRun {
@@ -98,6 +107,7 @@ export interface BacktestDetail {
   summary: BacktestRun
   monthly_breakdown: { month: string; trades: number; pnl: number; wins: number; losses: number; win_rate: number }[]
   exit_reason_breakdown: Record<string, { count: number; total_pnl: number }>
+  scanner_identified_at: string | null
   trades: {
     symbol: string
     entry_date: string
@@ -108,7 +118,97 @@ export interface BacktestDetail {
     profit_loss: number
     pnl_pct: number
     exit_reason: string
+    days_held: number | null
   }[]
+}
+
+export interface KiteStatus {
+  connected: boolean
+  user_name: string | null
+}
+
+export interface ExecuteTradeRequest {
+  symbol: string
+  price: number
+  capital_per_trade: number
+  scanner_name: string
+}
+
+export interface ExecuteTradeResponse {
+  status: string
+  trade_id: number
+  symbol: string
+  entry_price: number
+  quantity: number
+  capital_used: number
+  kite_buy_order: { order_id: string } | null
+  kite_sl_order: { order_id: string } | null
+  sl_price: number
+  target_price: number
+}
+
+export interface KiteMargins {
+  available_cash: number
+  live_balance: number
+  net: number
+}
+
+export interface KiteHolding {
+  symbol: string
+  quantity: number
+  avg_price: number
+  last_price: number
+  pnl: number
+  product: string
+  tracked: boolean
+}
+
+export interface KiteHoldingsResponse {
+  holdings: KiteHolding[]
+  count: number
+  tracked_count: number
+  untracked_count: number
+}
+
+export interface SyncResponse {
+  status: string
+  imported: number
+  sl_orders_placed: number
+  total_holdings: number
+  errors: string[]
+}
+
+export interface PortfolioPosition {
+  trade_id: number
+  symbol: string
+  qty: number
+  entry: number
+  ltp: number
+  pnl: number
+  pnl_pct: number
+}
+
+export interface PortfolioSummary {
+  total_cost: number
+  total_value: number
+  total_pnl: number
+  total_pnl_pct: number
+  positions: PortfolioPosition[]
+  is_market_open: boolean
+}
+
+export interface Alert {
+  id: number
+  created_at: string
+  alert_type: string
+  message: string
+  symbol: string | null
+  trade_id: number | null
+}
+
+export interface MarketStatus {
+  is_open: boolean
+  current_time: string
 }
 
 export const api = {
@@ -117,9 +217,21 @@ export const api = {
   getLatestScanner: () => get<ScannerData>('/scanner/latest'),
   getTrades: (status?: string) => get<Trade[]>(`/trades${status ? `?status=${status}` : ''}`),
   getTradeSummary: () => get<TradeSummary>('/trades/summary'),
-  runBacktest: (scanner_name: string, days: number) =>
-    post<{ message: string }>(`/backtest/run?scanner_name=${encodeURIComponent(scanner_name)}&days=${days}`),
+  runBacktest: (scanner_name: string, days: number, capital_per_trade: number) =>
+    post<{ message: string }>(`/backtest/run?scanner_name=${encodeURIComponent(scanner_name)}&days=${days}&capital_per_trade=${capital_per_trade}`),
   getBacktestRuns: () => get<BacktestRun[]>('/backtest/runs'),
   getBacktestDetail: (id: number) => get<BacktestDetail>(`/backtest/runs/${id}`),
   checkPositions: () => post<{ message: string }>('/positions/check'),
+  getKiteLoginUrl: () => get<{ login_url: string }>('/kite/login-url'),
+  connectKite: (requestToken: string) => post<{ status: string; user_name: string }>('/kite/connect', { request_token: requestToken }),
+  getKiteStatus: () => get<KiteStatus>('/kite/status'),
+  kiteLogout: () => post<{ status: string }>('/kite/logout'),
+  executeTrade: (req: ExecuteTradeRequest) => post<ExecuteTradeResponse>('/trades/execute', req),
+  cancelTrade: (tradeId: number) => post<{ status: string; trade_id: number }>(`/trades/${tradeId}/cancel`),
+  getKiteMargins: () => get<KiteMargins>('/kite/margins'),
+  getKiteHoldings: () => get<KiteHoldingsResponse>('/kite/holdings'),
+  syncKitePositions: () => post<SyncResponse>('/trades/sync'),
+  getPortfolioSummary: () => get<PortfolioSummary>('/portfolio/summary'),
+  getAlerts: (limit?: number) => get<Alert[]>(`/alerts${limit ? `?limit=${limit}` : ''}`),
+  getMarketStatus: () => get<MarketStatus>('/market/status'),
 }

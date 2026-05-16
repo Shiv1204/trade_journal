@@ -14,10 +14,16 @@ KITE_TOTP_KEY = os.getenv("KITE_TOTP_KEY")
 
 DB_PATH = "sqlite:///trade_journal.db"
 
-STOP_LOSS_PCT = 2.0
-TARGET_PCT = 5.0
+STOP_LOSS_PCT = 3.0
+TARGET_PCT = 6.0
 MAX_HOLDING_DAYS = 10
-CAPITAL_PER_TRADE = 50000
+CAPITAL_PER_TRADE = 1000
+MAX_POSITIONS = 5
+RISK_PCT_PER_TRADE = 2.0
+TRAIL_BREAKEVEN_PCT = 2.0
+TRAIL_TRIGGER_PCT = 4.0
+TRAIL_STEP_PCT = 2.0
+DAILY_LOSS_LIMIT_PCT = 5.0
 
 SCANNER_1_URL = "https://chartink.com/screener/copy-monthly-rsi-above-50-3672"
 SCANNER_2_URL = "https://chartink.com/screener/top-scanner-combo"

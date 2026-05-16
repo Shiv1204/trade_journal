@@ -1,28 +1,63 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Depends, Query, BackgroundTasks
+from fastapi import FastAPI, Depends, Query, BackgroundTasks, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from backend.database import init_db, get_db, SessionLocal
-from backend.models import Trade, TradeStatus, ScannerRun, ScannerResult
+from backend.models import Trade, TradeStatus, ExitReason, ScannerRun, ScannerResult
 from backend.models import BacktestRun, BacktestTrade
 from backend.scanner.scraper import scrape_both_scanners
 from backend.scanner.dedup import find_duplicates
+from backend.scanner.scorer import score_duplicate
 from backend.backtest.engine import run_backtest, NSE_SYMBOLS
 from backend.backtest.metrics import get_run_summary, get_monthly_breakdown, get_trades_by_exit_reason
 from backend.broker.position_manager import PositionManager
-from backend.config import SCANNER_1_NAME, SCANNER_2_NAME
+from backend.broker.kite_client import KiteClient
+from backend.broker.kite_client import is_market_open
+from backend.config import SCANNER_1_NAME, SCANNER_2_NAME, KITE_API_KEY, KITE_API_SECRET
+
+
+kite_client = KiteClient()
+position_manager = PositionManager()
+position_manager.set_kite(kite_client)
+
+scheduler = BackgroundScheduler()
+
+
+def _scheduled_position_check():
+    now = datetime.now(timezone.utc)
+    if now.weekday() >= 5:
+        return
+    hour = (now.hour + 5) % 24
+    minute = now.minute + 30
+    if minute >= 60:
+        hour = (hour + 1) % 24
+        minute -= 60
+    ist_total = hour * 60 + minute
+    if ist_total < 555 or ist_total > 930:
+        return
+    db = SessionLocal()
+    try:
+        position_manager.check_positions(db=db)
+    except Exception as e:
+        print(f"[Scheduler] Position check error: {e}")
+    finally:
+        db.close()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    scheduler.add_job(_scheduled_position_check, "interval", minutes=5, id="position_check")
+    scheduler.start()
     yield
+    scheduler.shutdown()
 
 
 app = FastAPI(title="Trade Journal API", lifespan=lifespan)
@@ -34,8 +69,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-position_manager = PositionManager()
 
 
 @app.get("/api/health")
@@ -98,10 +131,31 @@ def get_latest_scanner_results(db: Session = Depends(get_db)):
     scanner_2_results = format_results(run_2)
 
     dedup = find_duplicates(scanner_1_results, scanner_2_results)
+
+    bt_trades: list = []
+    try:
+        latest_bt = db.query(BacktestRun).filter(
+            BacktestRun.scanner_name == SCANNER_1_NAME
+        ).order_by(BacktestRun.id.desc()).first()
+        if latest_bt:
+            bt_trades = db.query(BacktestTrade).filter(
+                BacktestTrade.backtest_run_id == latest_bt.id
+            ).all()
+    except Exception:
+        pass
+
+    scored_entries = []
+    for entry in dedup.get("trade_entries", []):
+        scored = score_duplicate(entry, bt_trades)
+        entry.update(scored)
+        scored_entries.append(entry)
+
+    scored_entries.sort(key=lambda e: e.get("score", 0), reverse=True)
+
     return {
         "scanner_1": {"name": SCANNER_1_NAME, "results": scanner_1_results, "count": len(scanner_1_results)},
         "scanner_2": {"name": SCANNER_2_NAME, "results": scanner_2_results, "count": len(scanner_2_results)},
-        "dedup": dedup,
+        "dedup": {**dedup, "trade_entries": scored_entries},
     }
 
 
@@ -169,14 +223,41 @@ def start_backtest(
     background_tasks: BackgroundTasks,
     scanner_name: str = Query(SCANNER_1_NAME),
     days: int = Query(365),
+    capital_per_trade: int = Query(100000),
 ):
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days)
 
+    backtest_symbols: list[str] = []
+    seen: set[str] = set()
+    try:
+        db_temp = SessionLocal()
+        for name in [SCANNER_1_NAME, SCANNER_2_NAME]:
+            latest_run = db_temp.query(ScannerRun).filter(
+                ScannerRun.scanner_name == name
+            ).order_by(ScannerRun.id.desc()).first()
+            if latest_run:
+                results = db_temp.query(ScannerResult).filter(
+                    ScannerResult.run_id == latest_run.id
+                ).all()
+                for r in results:
+                    sym = r.symbol.strip().upper()
+                    if sym and sym not in seen:
+                        seen.add(sym)
+                        backtest_symbols.append(sym + ".NS")
+        db_temp.close()
+    except Exception as e:
+        print(f"[Backtest] Failed to get scanner symbols: {e}")
+
+    if not backtest_symbols:
+        print("[Backtest] No scanner results, running on sample symbols")
+        backtest_symbols = NSE_SYMBOLS[:10]
+
     def _run():
         db = SessionLocal()
         try:
-            run_backtest(scanner_name, start_date, end_date, db=db)
+            print(f"[Backtest] Running on {len(backtest_symbols)} stocks: {backtest_symbols}")
+            run_backtest(scanner_name, start_date, end_date, symbols=backtest_symbols, capital_per_trade=capital_per_trade, db=db)
         except Exception as e:
             print(f"[Backtest Error] {e}")
             import traceback
@@ -207,10 +288,15 @@ def get_backtest_run_detail(run_id: int, db: Session = Depends(get_db)):
     trades = db.query(BacktestTrade).filter(BacktestTrade.backtest_run_id == run_id).all()
     monthly = get_monthly_breakdown(trades)
     by_reason = get_trades_by_exit_reason(trades)
+
+    latest_scanner = db.query(ScannerRun).order_by(ScannerRun.id.desc()).first()
+    scanner_identified_at = latest_scanner.run_at.isoformat() if latest_scanner else None
+
     return {
         "summary": get_run_summary(run),
         "monthly_breakdown": monthly,
         "exit_reason_breakdown": by_reason,
+        "scanner_identified_at": scanner_identified_at,
         "trades": [
             {
                 "symbol": t.symbol,
@@ -222,10 +308,284 @@ def get_backtest_run_detail(run_id: int, db: Session = Depends(get_db)):
                 "profit_loss": t.profit_loss,
                 "pnl_pct": t.pnl_pct,
                 "exit_reason": t.exit_reason.value if t.exit_reason else None,
+                "days_held": (t.exit_date - t.entry_date).days if t.exit_date and t.entry_date else None,
             }
             for t in trades
         ],
     }
+
+
+@app.get("/api/kite/callback")
+def kite_callback(request_token: str = Query(...), status: str = Query("success")):
+    if status != "success":
+        return HTMLResponse("<h2>Login failed</h2><p>Kite login was unsuccessful.</p>", status_code=400)
+    try:
+        session = kite_client.generate_session(request_token)
+        return HTMLResponse(f"""
+        <html><head><title>Kite Connected</title></head><body>
+        <h2>Kite Connected</h2><p>Logged in as {session.get('user_name', 'Unknown')}.</p>
+        <p>You can close this window and return to the Trade Journal.</p>
+        <script>window.close();</script>
+        </body></html>
+        """)
+    except Exception as e:
+        return HTMLResponse(f"<h2>Connection failed</h2><p>{e}</p>", status_code=400)
+
+
+@app.get("/api/market/status")
+def market_status():
+    return {
+        "is_open": is_market_open(),
+        "current_time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/kite/login-url")
+def get_kite_login_url():
+    url = kite_client.get_login_url()
+    return {"login_url": url}
+
+
+@app.post("/api/kite/connect")
+def connect_kite(body: dict = Body(...)):
+    request_token = body.get("request_token")
+    if not request_token:
+        return JSONResponse(status_code=400, content={"error": "request_token required"})
+    try:
+        session = kite_client.generate_session(request_token)
+        return {"status": "connected", "user_name": session.get("user_name")}
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+
+@app.get("/api/kite/status")
+def get_kite_status():
+    return {
+        "connected": kite_client.connected,
+        "user_name": kite_client.user_name,
+    }
+
+
+@app.post("/api/kite/logout")
+def logout_kite():
+    kite_client.logout()
+    return {"status": "disconnected"}
+
+
+@app.post("/api/trades/execute")
+def execute_trade(body: dict = Body(...)):
+    if not is_market_open():
+        return JSONResponse(status_code=400, content={
+            "error": "Market is closed. Trading hours: 9:15 AM - 3:30 PM IST, Mon-Fri"
+        })
+
+    symbol = body.get("symbol", "").strip().upper()
+    price = body.get("price")
+    capital_per_trade = int(body.get("capital_per_trade", 100000))
+    scanner_name = body.get("scanner_name", "")
+
+    if not symbol or not price:
+        return JSONResponse(status_code=400, content={"error": "symbol and price required"})
+
+    entry_price = float(price)
+    if entry_price <= 0:
+        return JSONResponse(status_code=400, content={"error": "invalid price"})
+
+    sl_pct = 3.0
+    quantity = int(capital_per_trade / entry_price)
+
+    from backend.config import MAX_POSITIONS, RISK_PCT_PER_TRADE, DAILY_LOSS_LIMIT_PCT
+    db = SessionLocal()
+    try:
+        open_count = db.query(Trade).filter(Trade.status == TradeStatus.OPEN).count()
+        if open_count >= MAX_POSITIONS:
+            db.close()
+            return JSONResponse(status_code=400, content={
+                "error": f"Max {MAX_POSITIONS} concurrent positions. Close some trades first."
+            })
+
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_closed = db.query(Trade).filter(
+            Trade.status == TradeStatus.CLOSED,
+            Trade.exit_date >= today_start,
+        ).all()
+        today_loss = sum(abs(t.profit_loss or 0) for t in today_closed if (t.profit_loss or 0) < 0)
+        if kite_client.connected:
+            try:
+                margins = kite_client._api_get("/user/margins/equity")
+                available = float(margins.get("data", {}).get("available", {}).get("live_balance", 0))
+                if available > 0 and today_loss > 0:
+                    daily_loss_pct = (today_loss / available) * 100
+                    if daily_loss_pct >= DAILY_LOSS_LIMIT_PCT:
+                        db.close()
+                        return JSONResponse(status_code=400, content={
+                            "error": f"Daily loss limit ({DAILY_LOSS_LIMIT_PCT}%) reached. Today: {today_loss:.0f} loss."
+                        })
+                if available > 0:
+                    risk_amount = available * (RISK_PCT_PER_TRADE / 100)
+                    risk_per_share = entry_price * (sl_pct / 100)
+                    risk_qty = int(risk_amount / risk_per_share) if risk_per_share > 0 else 1
+                    if risk_qty >= 1:
+                        quantity = risk_qty
+            except Exception:
+                pass
+
+        if quantity < 1:
+            db.close()
+            return JSONResponse(status_code=400, content={"error": f"capital {capital_per_trade} too low for price {entry_price}"})
+
+        buy_order = None
+        sl_order = None
+        if kite_client.connected:
+            try:
+                buy_order = kite_client.place_market_order(symbol, quantity, "BUY")
+                if buy_order:
+                    print(f"[Trade] BUY {symbol} x{quantity}: {buy_order['order_id']}")
+                else:
+                    print(f"[Trade] BUY failed for {symbol}, saving trade record anyway")
+            except Exception as e:
+                print(f"[Trade] BUY order error: {e}")
+
+            if buy_order:
+                try:
+                    sl_price = round(entry_price * (1 - 3 / 100), 2)
+                    sl_order = kite_client.place_sl_order(symbol, quantity, sl_price)
+                    if sl_order:
+                        print(f"[Trade] SL order for {symbol}: {sl_order['order_id']}")
+                except Exception as e:
+                    print(f"[Trade] SL order error: {e}")
+
+        trade = Trade(
+            symbol=symbol,
+            entry_price=entry_price,
+            quantity=quantity,
+            entry_date=datetime.now(timezone.utc),
+            status=TradeStatus.OPEN,
+            scanner_name=scanner_name,
+            kite_order_id=buy_order["order_id"] if buy_order else None,
+            kite_sl_order_id=sl_order["order_id"] if sl_order else None,
+        )
+        db.add(trade)
+        db.commit()
+        db.refresh(trade)
+
+        try:
+            from backend.models import Alert
+            alert = Alert(
+                alert_type="entry",
+                message=f"{symbol} BOUGHT x{quantity} @ ₹{entry_price} | SL: ₹{round(entry_price * 0.97, 2)}",
+                trade_id=trade.id,
+                symbol=symbol,
+            )
+            db.add(alert)
+            db.commit()
+        except Exception:
+            pass
+
+        return {
+            "status": "trade_opened",
+            "trade_id": trade.id,
+            "symbol": symbol,
+            "entry_price": entry_price,
+            "quantity": quantity,
+            "capital_used": round(entry_price * quantity, 2),
+            "kite_buy_order": buy_order,
+            "kite_sl_order": sl_order,
+            "sl_price": round(entry_price * (1 - 3 / 100), 2),
+            "target_price": round(entry_price * (1 + 6 / 100), 2),
+        }
+    except Exception as e:
+        db.rollback()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        db.close()
+
+
+@app.get("/api/kite/margins")
+def get_kite_margins():
+    if not kite_client.connected:
+        return JSONResponse(status_code=400, content={"error": "Kite not connected"})
+    try:
+        import requests
+        resp = requests.get(
+            "https://api.kite.trade/user/margins/equity",
+            headers=kite_client._headers(),
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("status") != "success":
+            return JSONResponse(status_code=500, content={"error": "Failed to fetch margins"})
+        equity = data["data"]
+        return {
+            "available_cash": equity.get("available", {}).get("cash", 0),
+            "live_balance": equity.get("available", {}).get("live_balance", 0),
+            "net": equity.get("net", 0),
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/kite/holdings")
+def get_kite_holdings_summary():
+    if not kite_client.connected:
+        return JSONResponse(status_code=400, content={"error": "Kite not connected"})
+    try:
+        holdings = kite_client.get_holdings()
+        db = SessionLocal()
+        try:
+            open_trades = db.query(Trade).filter(Trade.status == TradeStatus.OPEN).all()
+            tracked_symbols = {t.symbol.upper() for t in open_trades}
+        finally:
+            db.close()
+
+        parsed = []
+        for h in holdings:
+            sym = (h.get("tradingsymbol") or "").strip().upper()
+            parsed.append({
+                "symbol": sym,
+                "quantity": h.get("quantity", 0),
+                "avg_price": h.get("average_price", 0),
+                "last_price": h.get("last_price", 0),
+                "pnl": h.get("pnl", 0),
+                "product": h.get("product", ""),
+                "tracked": sym in tracked_symbols,
+            })
+        return {
+            "holdings": parsed,
+            "count": len(parsed),
+            "tracked_count": sum(1 for p in parsed if p["tracked"]),
+            "untracked_count": sum(1 for p in parsed if not p["tracked"]),
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/api/trades/{trade_id}/cancel")
+def cancel_trade(trade_id: int, db: Session = Depends(get_db)):
+    trade = db.query(Trade).filter(Trade.id == trade_id).first()
+    if not trade:
+        return JSONResponse(status_code=404, content={"error": "Trade not found"})
+    if trade.status != TradeStatus.OPEN:
+        return JSONResponse(status_code=400, content={"error": "Only open trades can be cancelled"})
+
+    if is_market_open():
+        try:
+            if kite_client.connected:
+                kite_client.place_market_order(trade.symbol, trade.quantity, "SELL")
+                if trade.kite_sl_order_id:
+                    kite_client.cancel_order(trade.kite_sl_order_id)
+        except Exception as e:
+            print(f"[Cancel] Kite exit order error: {e}")
+
+    trade.status = TradeStatus.CLOSED
+    trade.exit_date = datetime.now(timezone.utc)
+    trade.exit_reason = ExitReason.MANUAL
+    trade.exit_price = trade.entry_price
+    trade.profit_loss = 0
+    trade.pnl_pct = 0
+    db.commit()
+
+    return {"status": "cancelled", "trade_id": trade.id}
 
 
 @app.post("/api/positions/check")
@@ -239,6 +599,76 @@ def check_positions(background_tasks: BackgroundTasks):
 
     background_tasks.add_task(_check)
     return {"message": "Position check started"}
+
+
+@app.get("/api/portfolio/summary")
+def portfolio_summary():
+    open_trades = []
+    total_cost = 0.0
+    total_value = 0.0
+    total_pnl = 0.0
+
+    db = SessionLocal()
+    try:
+        open_trades = db.query(Trade).filter(Trade.status == TradeStatus.OPEN).all()
+        if not open_trades:
+            return {"total_cost": 0, "total_value": 0, "total_pnl": 0, "positions": [], "is_market_open": is_market_open()}
+
+        symbols = list({t.symbol for t in open_trades})
+        ltp_map = {}
+        if kite_client.connected:
+            try:
+                ltp_map = kite_client.get_ltp(symbols)
+            except Exception:
+                pass
+
+        positions = []
+        for t in open_trades:
+            cost = t.entry_price * t.quantity
+            ltp = ltp_map.get(t.symbol, t.entry_price)
+            current_val = ltp * t.quantity
+            pnl = current_val - cost
+            pnl_pct = ((ltp - t.entry_price) / t.entry_price) * 100 if t.entry_price > 0 else 0
+            total_cost += cost
+            total_value += current_val
+            total_pnl += pnl
+            positions.append({
+                "trade_id": t.id,
+                "symbol": t.symbol,
+                "qty": t.quantity,
+                "entry": round(t.entry_price, 2),
+                "ltp": round(ltp, 2),
+                "pnl": round(pnl, 2),
+                "pnl_pct": round(pnl_pct, 2),
+            })
+
+        return {
+            "total_cost": round(total_cost, 2),
+            "total_value": round(total_value, 2),
+            "total_pnl": round(total_pnl, 2),
+            "total_pnl_pct": round((total_pnl / total_cost) * 100, 2) if total_cost > 0 else 0,
+            "positions": positions,
+            "is_market_open": is_market_open(),
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/alerts")
+def get_alerts(limit: int = 20, db: Session = Depends(get_db)):
+    from backend.models import Alert
+    alerts = db.query(Alert).order_by(Alert.id.desc()).limit(limit).all()
+    return [
+        {
+            "id": a.id,
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+            "alert_type": a.alert_type,
+            "message": a.message,
+            "symbol": a.symbol,
+            "trade_id": a.trade_id,
+        }
+        for a in alerts
+    ]
 
 
 frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
