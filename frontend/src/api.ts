@@ -101,6 +101,11 @@ export interface BacktestRun {
   avg_loss: number
   max_drawdown: number
   sharpe_ratio: number
+  sl_pct: number | null
+  target_pct: number | null
+  max_hold_days: number | null
+  capital_per_trade: number | null
+  created_at: string
 }
 
 export interface BacktestDetail {
@@ -217,8 +222,10 @@ export const api = {
   getLatestScanner: () => get<ScannerData>('/scanner/latest'),
   getTrades: (status?: string) => get<Trade[]>(`/trades${status ? `?status=${status}` : ''}`),
   getTradeSummary: () => get<TradeSummary>('/trades/summary'),
-  runBacktest: (scanner_name: string, days: number, capital_per_trade: number) =>
-    post<{ message: string }>(`/backtest/run?scanner_name=${encodeURIComponent(scanner_name)}&days=${days}&capital_per_trade=${capital_per_trade}`),
+  runBacktest: (days: number, capital_per_trade: number, sl_pct: number, target_pct: number, max_hold_days: number) =>
+    post<{ message: string }>(`/backtest/run?days=${days}&capital_per_trade=${capital_per_trade}&sl_pct=${sl_pct}&target_pct=${target_pct}&max_hold_days=${max_hold_days}`),
+  runOptimization: (days: number, capital_per_trade: number) =>
+    post<{ message: string }>(`/backtest/optimize?days=${days}&capital_per_trade=${capital_per_trade}`),
   getBacktestRuns: () => get<BacktestRun[]>('/backtest/runs'),
   getBacktestDetail: (id: number) => get<BacktestDetail>(`/backtest/runs/${id}`),
   checkPositions: () => post<{ message: string }>('/positions/check'),

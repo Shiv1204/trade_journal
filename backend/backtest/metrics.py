@@ -17,6 +17,10 @@ def get_run_summary(run: BacktestRun) -> dict:
         "avg_loss": run.avg_loss,
         "max_drawdown": run.max_drawdown,
         "sharpe_ratio": run.sharpe_ratio,
+        "sl_pct": run.sl_pct,
+        "target_pct": run.target_pct,
+        "max_hold_days": run.max_hold_days,
+        "capital_per_trade": run.capital_per_trade,
         "created_at": run.created_at.isoformat() if run.created_at else None,
     }
 

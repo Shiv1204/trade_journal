@@ -15,7 +15,11 @@ from backend.models import BacktestRun, BacktestTrade
 from backend.scanner.scraper import scrape_both_scanners
 from backend.scanner.dedup import find_duplicates
 from backend.scanner.scorer import score_duplicate
-from backend.backtest.engine import run_backtest, NSE_SYMBOLS
+from backend.scanner.universe import ensure_universe, build_universe_from_kite, get_universe_count, get_universe_symbols
+from backend.scanner.ohlc_cache import refresh_cache
+from backend.scanner.native_scanner import run_native_scan
+from backend.backtest.engine import run_walk_forward_backtest, NSE_SYMBOLS
+from backend.backtest.optimizer import run_parameter_sweep
 from backend.backtest.metrics import get_run_summary, get_monthly_breakdown, get_trades_by_exit_reason
 from backend.broker.position_manager import PositionManager
 from backend.broker.kite_client import KiteClient
@@ -51,10 +55,21 @@ def _scheduled_position_check():
         db.close()
 
 
+def _scheduled_native_scan():
+    if not is_market_open():
+        return
+    try:
+        result = run_native_scan(kite_client=kite_client)
+        print(f"[Scheduler] Native scan: {result.get('passed', 0)}/{result.get('total_scanned', 0)} passed")
+    except Exception as e:
+        print(f"[Scheduler] Native scan error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     scheduler.add_job(_scheduled_position_check, "interval", minutes=5, id="position_check")
+    scheduler.add_job(_scheduled_native_scan, "interval", minutes=5, id="native_scan")
     scheduler.start()
     yield
     scheduler.shutdown()
@@ -113,6 +128,60 @@ def run_scanner(background_tasks: BackgroundTasks):
 
     background_tasks.add_task(_scrape_and_store)
     return {"message": "Scanner run started in background"}
+
+
+@app.post("/api/scanner/native/run")
+def run_native_scanner():
+    result = run_native_scan(kite_client=kite_client)
+    return result
+
+
+@app.post("/api/scanner/cache/refresh")
+def refresh_ohlc_cache(background_tasks: BackgroundTasks):
+    def _refresh():
+        symbols = get_universe_symbols()
+        if not symbols:
+            symbols = ensure_universe()
+        count = refresh_cache(symbols)
+        print(f"[Cache] Refreshed: {count} rows for {len(symbols)} stocks")
+    background_tasks.add_task(_refresh)
+    return {"message": "Cache refresh started", "universe_size": len(get_universe_symbols())}
+
+
+@app.post("/api/scanner/universe/build")
+def build_universe():
+    count = build_universe_from_kite()
+    if count == 0:
+        from backend.scanner.universe import _static_fallback
+        _static_fallback()
+        count = get_universe_count()
+    return {"message": f"Universe built: {count} stocks"}
+
+
+@app.get("/api/scanner/universe")
+def get_universe():
+    return {"count": get_universe_count(), "symbols": get_universe_symbols()[:50]}
+
+
+@app.get("/api/scanner/native/latest")
+def get_latest_native_results(db: Session = Depends(get_db)):
+    run = db.query(ScannerRun).filter(
+        ScannerRun.scanner_name == "Native 7-Factor"
+    ).order_by(ScannerRun.id.desc()).first()
+    if not run:
+        return {"scanner_name": "Native 7-Factor", "results": [], "total_scanned": 0, "passed": 0}
+    results = db.query(ScannerResult).filter(ScannerResult.run_id == run.id).all()
+    return {
+        "scanner_name": "Native 7-Factor",
+        "run_at": run.run_at.isoformat() if run.run_at else None,
+        "total_scanned": get_universe_count(),
+        "passed": len(results),
+        "results": [
+            {"symbol": r.symbol, "price": r.price, "volume": r.volume,
+             "daily_rsi": r.daily_rsi, "weekly_rsi": r.weekly_rsi}
+            for r in results
+        ],
+    }
 
 
 @app.get("/api/scanner/latest")
@@ -221,43 +290,93 @@ def get_trade_summary(db: Session = Depends(get_db)):
 @app.post("/api/backtest/run")
 def start_backtest(
     background_tasks: BackgroundTasks,
-    scanner_name: str = Query(SCANNER_1_NAME),
     days: int = Query(365),
     capital_per_trade: int = Query(100000),
+    sl_pct: float = Query(3.0),
+    target_pct: float = Query(6.0),
+    max_hold_days: int = Query(10),
 ):
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=days)
-
     backtest_symbols: list[str] = []
     seen: set[str] = set()
     try:
-        db_temp = SessionLocal()
-        for name in [SCANNER_1_NAME, SCANNER_2_NAME]:
-            latest_run = db_temp.query(ScannerRun).filter(
-                ScannerRun.scanner_name == name
-            ).order_by(ScannerRun.id.desc()).first()
-            if latest_run:
-                results = db_temp.query(ScannerResult).filter(
-                    ScannerResult.run_id == latest_run.id
-                ).all()
-                for r in results:
-                    sym = r.symbol.strip().upper()
-                    if sym and sym not in seen:
-                        seen.add(sym)
-                        backtest_symbols.append(sym + ".NS")
-        db_temp.close()
-    except Exception as e:
-        print(f"[Backtest] Failed to get scanner symbols: {e}")
+        universe_syms = get_universe_symbols()
+        if universe_syms:
+            seen = set(universe_syms)
+            backtest_symbols = [s + ".NS" for s in universe_syms]
+    except Exception:
+        pass
 
     if not backtest_symbols:
-        print("[Backtest] No scanner results, running on sample symbols")
+        try:
+            db_temp = SessionLocal()
+            for name in [SCANNER_1_NAME, SCANNER_2_NAME]:
+                latest_run = db_temp.query(ScannerRun).filter(
+                    ScannerRun.scanner_name == name
+                ).order_by(ScannerRun.id.desc()).first()
+                if latest_run:
+                    results = db_temp.query(ScannerResult).filter(
+                        ScannerResult.run_id == latest_run.id
+                    ).all()
+                    for r in results:
+                        sym = r.symbol.strip().upper()
+                        if sym and sym not in seen:
+                            seen.add(sym)
+                            backtest_symbols.append(sym + ".NS")
+            db_temp.close()
+        except Exception as e:
+            print(f"[Backtest] Scanner symbol error: {e}")
+
+    if not backtest_symbols:
         backtest_symbols = NSE_SYMBOLS[:10]
 
     def _run():
         db = SessionLocal()
         try:
-            print(f"[Backtest] Running on {len(backtest_symbols)} stocks: {backtest_symbols}")
-            run_backtest(scanner_name, start_date, end_date, symbols=backtest_symbols, capital_per_trade=capital_per_trade, db=db)
+            print(f"[Backtest] WF on {len(backtest_symbols)} stocks: SL={sl_pct}% TGT={target_pct}% MAX={max_hold_days}d")
+            trades, summary = run_walk_forward_backtest(
+                symbols=backtest_symbols,
+                backtest_days=days,
+                capital_per_trade=capital_per_trade,
+                sl_pct=sl_pct,
+                target_pct=target_pct,
+                max_hold_days=max_hold_days,
+            )
+            run = BacktestRun(
+                scanner_name="Walk-Forward Combined",
+                start_date=datetime.now() - timedelta(days=days),
+                end_date=datetime.now(),
+                total_trades=summary["total_trades"],
+                winning_trades=summary["winning_trades"],
+                losing_trades=summary["losing_trades"],
+                win_rate=summary["win_rate"],
+                total_pnl=summary["total_pnl"],
+                avg_profit=summary["avg_profit"],
+                avg_loss=summary["avg_loss"],
+                max_drawdown=summary["max_drawdown"],
+                sharpe_ratio=summary["sharpe_ratio"],
+                sl_pct=sl_pct,
+                target_pct=target_pct,
+                max_hold_days=max_hold_days,
+                capital_per_trade=capital_per_trade,
+            )
+            db.add(run)
+            db.flush()
+            for t in trades:
+                bt = BacktestTrade(
+                    backtest_run_id=run.id,
+                    symbol=t["symbol"],
+                    entry_date=t["entry_date"],
+                    exit_date=t["exit_date"],
+                    entry_price=t["entry_price"],
+                    exit_price=t["exit_price"],
+                    quantity=t["quantity"],
+                    profit_loss=t["profit_loss"],
+                    pnl_pct=t["pnl_pct"],
+                    exit_reason=t["exit_reason"],
+                )
+                db.add(bt)
+            db.commit()
+            print(f"[Backtest] Saved run {run.id}: {summary['total_trades']} trades, {summary['win_rate']}% win")
         except Exception as e:
             print(f"[Backtest Error] {e}")
             import traceback
@@ -268,10 +387,93 @@ def start_backtest(
     background_tasks.add_task(_run)
     return {
         "message": "Backtest started",
-        "scanner_name": scanner_name,
-        "start_date": start_date.isoformat(),
-        "end_date": end_date.isoformat(),
+        "params": f"SL={sl_pct}% TGT={target_pct}% MAX={max_hold_days}d",
+        "symbols_count": len(backtest_symbols),
     }
+
+
+@app.post("/api/backtest/optimize")
+def start_optimization(
+    background_tasks: BackgroundTasks,
+    days: int = Query(365),
+    capital_per_trade: int = Query(100000),
+):
+    backtest_symbols: list[str] = []
+    seen: set[str] = set()
+    try:
+        universe_syms = get_universe_symbols()
+        if universe_syms:
+            seen = set(universe_syms)
+            backtest_symbols = [s + ".NS" for s in universe_syms]
+    except Exception:
+        pass
+
+    if not backtest_symbols:
+        try:
+            db_temp = SessionLocal()
+            for name in [SCANNER_1_NAME, SCANNER_2_NAME]:
+                latest_run = db_temp.query(ScannerRun).filter(
+                    ScannerRun.scanner_name == name
+                ).order_by(ScannerRun.id.desc()).first()
+                if latest_run:
+                    results = db_temp.query(ScannerResult).filter(
+                        ScannerResult.run_id == latest_run.id
+                    ).all()
+                    for r in results:
+                        sym = r.symbol.strip().upper()
+                        if sym and sym not in seen:
+                            seen.add(sym)
+                            backtest_symbols.append(sym + ".NS")
+            db_temp.close()
+        except Exception as e:
+            print(f"[Opt] Failed to get scanner symbols: {e}")
+
+    if not backtest_symbols:
+        backtest_symbols = NSE_SYMBOLS[:10]
+
+    def _run():
+        db = SessionLocal()
+        try:
+            print(f"[Opt] Sweeping SL[2-5] TGT[4-10] MAX[7-21] on {len(backtest_symbols)} stocks")
+            results = run_parameter_sweep(
+                symbols=backtest_symbols,
+                backtest_days=days,
+                capital_per_trade=capital_per_trade,
+                sl_range=(2.0, 5.0, 1.0),
+                target_range=(4.0, 10.0, 2.0),
+                max_hold_range=(7, 21, 7),
+            )
+            for r in results:
+                run = BacktestRun(
+                    scanner_name="Optimization",
+                    start_date=datetime.now() - timedelta(days=days),
+                    end_date=datetime.now(),
+                    total_trades=r["total_trades"],
+                    winning_trades=r["winning_trades"],
+                    losing_trades=r["losing_trades"],
+                    win_rate=r["win_rate"],
+                    total_pnl=r["total_pnl"],
+                    avg_profit=r["avg_profit"],
+                    avg_loss=r["avg_loss"],
+                    max_drawdown=r["max_drawdown"],
+                    sharpe_ratio=r["sharpe_ratio"],
+                    sl_pct=r["sl_pct"],
+                    target_pct=r["target_pct"],
+                    max_hold_days=r["max_hold_days"],
+                    capital_per_trade=r["capital_per_trade"],
+                )
+                db.add(run)
+            db.commit()
+            print(f"[Opt] Saved {len(results)} optimization runs")
+        except Exception as e:
+            print(f"[Opt Error] {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            db.close()
+
+    background_tasks.add_task(_run)
+    return {"message": "Optimization started", "symbols_count": len(backtest_symbols)}
 
 
 @app.get("/api/backtest/runs")

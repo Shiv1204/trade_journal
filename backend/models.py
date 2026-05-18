@@ -75,6 +75,10 @@ class BacktestRun(Base):
     avg_loss = Column(Float, nullable=True)
     max_drawdown = Column(Float, nullable=True)
     sharpe_ratio = Column(Float, nullable=True)
+    sl_pct = Column(Float, nullable=True)
+    target_pct = Column(Float, nullable=True)
+    max_hold_days = Column(Integer, nullable=True)
+    capital_per_trade = Column(Float, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     trades = relationship("BacktestTrade", back_populates="run", cascade="all, delete-orphan")
@@ -106,3 +110,36 @@ class Alert(Base):
     message = Column(String(500), nullable=False)
     trade_id = Column(Integer, nullable=True)
     symbol = Column(String(50), nullable=True)
+
+
+class StockUniverse(Base):
+    __tablename__ = "stock_universe"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(50), nullable=False, unique=True)
+    name = Column(String(200), nullable=True)
+    last_price = Column(Float, default=0)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class StockCache(Base):
+    __tablename__ = "stock_cache"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(50), nullable=False)
+    date = Column(DateTime, nullable=False)
+    open = Column(Float, default=0)
+    high = Column(Float, default=0)
+    low = Column(Float, default=0)
+    close = Column(Float, default=0)
+    volume = Column(Integer, default=0)
+    rsi_daily = Column(Float, nullable=True)
+    rsi_weekly = Column(Float, nullable=True)
+    rsi_monthly = Column(Float, nullable=True)
+    sma_20 = Column(Float, nullable=True)
+    sma_50 = Column(Float, nullable=True)
+    adx = Column(Float, nullable=True)
+    plus_di = Column(Float, nullable=True)
+    minus_di = Column(Float, nullable=True)
+    avg_volume_20d = Column(Float, nullable=True)
+    atr = Column(Float, nullable=True)
